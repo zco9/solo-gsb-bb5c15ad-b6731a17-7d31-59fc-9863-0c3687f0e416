@@ -467,3 +467,35 @@ class MergedStudyErrorDetail(BaseModel):
         default=[],
         description="引用目标在所有指定任务成功输出中均不存在的匿名 UID 列表",
     )
+
+
+# --------------------------------------------------------------------------- #
+# 实例 PNG 预览（GET /jobs/{id}/instances/{uid}/preview.png）
+# --------------------------------------------------------------------------- #
+class PreviewErrorDetail(BaseModel):
+    code: str = Field(
+        description="INSTANCE_NOT_FOUND（404） | JOB_NOT_READY（409） | "
+        "AMBIGUOUS_PREVIEW_INSTANCE（409） | "
+        "UNSUPPORTED_INSTANCE_FOR_PREVIEW（422） | "
+        "PREVIEW_PIXEL_DATA_MISSING（422） | PREVIEW_PIXEL_DECODE_FAILED（422） | "
+        "ANONYMIZED_OUTPUT_UNREADABLE（422）"
+    )
+    message: str
+    sop_instance_uid: Optional[str] = None
+    reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "not_in_output | ambiguous_output | unreadable | unsupported_image | "
+            "pixel_decode_failed | no_pixel_data"
+        ),
+    )
+    output_file: Optional[str] = None
+    output_files: list[str] = Field(
+        default=[], description="ambiguous_output 时给出相互冲突的扁平输出文件名"
+    )
+    constraint: Optional[str] = Field(
+        default=None, description="unsupported_image 时给出未满足的约束描述"
+    )
+    actual: Optional[str] = Field(
+        default=None, description="unsupported_image 时给出实例中的实际取值"
+    )

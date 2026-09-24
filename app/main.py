@@ -9,10 +9,10 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from .anonymizer import JobResult
-from . import consistency, dicomdir, merged_study, pagination, study_subset
+from . import consistency, dicomdir, merged_study, pagination, preview, study_subset
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -27,6 +27,7 @@ from .schemas import (
     MergedStudyDownloadRequest,
     MergedStudyErrorDetail,
     PatientOut,
+    PreviewErrorDetail,
     SeriesOut,
     StudyOut,
     StudySubsetErrorDetail,
@@ -491,6 +492,64 @@ def download_job(job_id: str):
 
 
 @app.get(
+    "/jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
+    tags=["jobs"],
+    summary="按匿名 SOPInstanceUID 渲染单帧灰度 PNG，供人工核对影像内容",
+    responses={
+        200: {"content": {"image/png": {}}, "description": "8 位灰度 PNG（MONOCHROME2 观感）"},
+        404: {"model": PreviewErrorDetail,
+              "description": "任务不存在/已过期，或该匿名 SOP UID 不在任务的成功输出中"},
+        409: {"model": PreviewErrorDetail,
+              "description": "任务未完成，或同一匿名 SOP UID 对应多份输出"},
+        422: {"model": PreviewErrorDetail,
+              "description": "匿名输出无法解码，或影像不支持预览（压缩传输语法 / 多帧 / 彩色 / "
+                             "非 8、16 位 / 缺 PixelData 等）"},
+    },
+)
+def get_instance_preview(job_id: str, sop_instance_uid: str) -> Response:
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+                "sop_instance_uid": sop_instance_uid,
+            },
+        )
+
+    try:
+        result = preview.render_preview(job, sop_instance_uid)
+    except preview.PreviewError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.detail) from exc
+
+    safe_uid = "".join(
+        ch for ch in sop_instance_uid if ch.isalnum() or ch in ".-"
+    )
+    headers = {
+        "X-Preview-Rows": str(result.rows),
+        "X-Preview-Columns": str(result.columns),
+        "X-Preview-Bits-Allocated": str(result.bits_allocated),
+        "X-Preview-Pixel-Representation": str(result.pixel_representation),
+        "X-Preview-Photometric-Interpretation": result.photometric,
+        "X-Preview-Rescale-Slope": str(result.rescale_slope),
+        "X-Preview-Rescale-Intercept": str(result.rescale_intercept),
+        "X-Preview-Window-Mode": result.window_mode,
+        # inline：浏览器直接显示图片用于人工核对
+        "Content-Disposition": (
+            f'inline; filename="preview-{safe_uid[-24:]}.png"'
+        ),
+    }
+    if result.window_center is not None:
+        headers["X-Preview-Window-Center"] = str(result.window_center)
+    if result.window_width is not None:
+        headers["X-Preview-Window-Width"] = str(result.window_width)
+    return Response(content=result.png, media_type="image/png", headers=headers)
+
+
+@app.get(
     "/jobs/{job_id}/studies/{study_instance_uid}/download",
     tags=["jobs"],
     summary="按匿名 StudyInstanceUID 下载检查子集（自动补全跨检查 SOP 引用闭包）",
@@ -617,6 +676,7 @@ def root() -> dict:
             "GET /jobs/{job_id}",
             "GET /jobs/{job_id}/files",
             "GET /jobs/{job_id}/download",
+            "GET /jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
             "GET /jobs/{job_id}/dicomdir/download",
             "GET /jobs/{job_id}/studies/{study_instance_uid}/download",
             "GET /health",
