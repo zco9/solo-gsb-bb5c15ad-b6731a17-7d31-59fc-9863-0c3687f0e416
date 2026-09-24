@@ -76,6 +76,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP（全量） |
 | `GET` | `/jobs/{job_id}/dicomdir/download` | 下载带 **DICOMDIR** 的离线阅片 ZIP：按匿名伪名 / Study/Series/SOP UID 重建四级目录层级，实例映射为合规稳定短 File ID |
 | `GET` | `/jobs/{job_id}/studies/{study_instance_uid}/download` | 按**匿名 StudyInstanceUID** 下载检查子集（递归补全 SOP 引用闭包，含跨检查引用） |
+| `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/preview.png` | 按**匿名 SOPInstanceUID** 返回实例影像的 8 位灰度 **PNG 预览**（未压缩、单帧、8/16 位 MONOCHROME1/2），供人工核对影像内容 |
 | `GET` | `/health` | 健康检查 |
 
 ### 表单参数（`POST /jobs`）
@@ -270,6 +271,117 @@ else:
           "实例：", resp.headers["X-Dicomdir-File-Count"])
     open("dicomdir.zip", "wb").write(resp.content)
 ```
+
+### 实例影像 PNG 预览（`GET /jobs/{job_id}/instances/{sop_instance_uid}/preview.png`）
+
+匿名化完成后，如需在导入 PACS 前**人工抽查影像内容本身**（而不只是标签），可按
+**匿名 SOPInstanceUID** 取回该实例的 8 位灰度 PNG。数据**只来自已完成任务 output
+目录中的匿名 DICOM 文件**，像素即匿名结果中的实际像素（匿名化不重编码、不改像素），
+不重新解压或处理原始 ZIP。
+
+`sop_instance_uid` 必须是任务结果中的**匿名后** UID，取自 `GET /jobs/{id}` 响应里
+`files[].sop_instance_uid`（成功文件的 `output_name` 去掉 `.dcm` 也是它）。
+
+**渲染管线**（严格按以下顺序）：
+
+1. 应用 Modality LUT 的线性形式：`value = pixel × RescaleSlope + RescaleIntercept`
+   （缺省 slope=1、intercept=0）；
+2. 按 `WindowCenter` / `WindowWidth` 的**首项**（VM>1 时只取第 1 个值）依
+   DICOM PS3.3 C.11.2.1.2 标准线性公式映射到 8 位灰度；两个标签任一缺失/为空时
+   **改按像素最小/最大值线性拉伸**（常量影像为全黑）；
+3. `MONOCHROME1`（值越大越暗）在**最后**对灰度反相；`MONOCHROME2` 不反相。
+
+**支持范围**（范围外影像明确报错，不静默返回错误内容、也不静默挑文件）：
+
+| 条件 | 要求 |
+| --- | --- |
+| 传输语法 | 仅未压缩 native：Implicit VR Little Endian、Explicit VR Little Endian、Explicit VR Big Endian；JPEG / JPEG-LS / JPEG 2000 / RLE 等封装语法与 Deflated Explicit VR 一律拒绝 |
+| 帧数 | 单帧（`NumberOfFrames` 缺省或为 1；>1 拒绝） |
+| 采样 | `SamplesPerPixel=1` |
+| 光度解释 | `MONOCHROME1` / `MONOCHROME2`（RGB / PALETTE COLOR / YBR 等拒绝） |
+| 位深 | `BitsAllocated=8/16`，且 `BitsStored/HighBit/PixelRepresentation` 合法（pydicom 负责按 BitsStored 掩码与符号扩展） |
+
+像素数据缺失（如 RTSTRUCT 等非影像对象）、PixelData 截断或与
+Rows/Columns/BitsAllocated 不符而无法解码、Rescale/Window 取值非法时同样返回
+`422`。
+
+同一匿名 SOP UID 对应**多份输出文件**（输入 ZIP 内重复实例，引擎已改名为
+`<uid>.dcm` / `<uid>-2.dcm`）时**不挑选、不猜测**，返回 `409` 并在
+`output_files` 中列出冲突文件；该 UID 不在任务成功输出中返回 `404`。
+
+错误响应（HTTP 4xx，`detail.code` 机器可读，`detail.reason` 给出 422 的细分原因）：
+
+| 状态码 | `detail.code` | 触发条件 |
+| --- | --- | --- |
+| `404` | `JOB_NOT_FOUND` | 任务 ID 不存在或已过期 |
+| `404` | `INSTANCE_NOT_FOUND` | 该匿名 SOPInstanceUID 不在任务的成功输出中 |
+| `404` | `INSTANCE_OUTPUT_MISSING` | 任务记录有该输出但磁盘文件已不存在（`reason=output_missing`） |
+| `409` | `JOB_NOT_READY` | 任务 `status != ready`（匿名化处理失败） |
+| `409` | `AMBIGUOUS_INSTANCE_OUTPUT` | 同一匿名 SOP UID 对应多份输出文件（`reason=ambiguous_output`，`output_files` 列出冲突文件） |
+| `422` | `PREVIEW_UNSUPPORTED_IMAGE` | 无法解码或影像类型不支持；`reason` 取值：`unreadable`、`unsupported_transfer_syntax`、`unsupported_samples_per_pixel`、`unsupported_photometric_interpretation`、`multiframe`、`unsupported_bit_depth`、`invalid_pixel_metadata`、`missing_pixel_data`、`pixel_decode_failed`、`invalid_rescale`、`invalid_voi_window`、`sop_instance_uid_mismatch` |
+
+成功时返回 `image/png`（`Content-Disposition: inline`，可直接在浏览器打开核对），
+并通过响应头回传渲染参数：
+
+| 响应头 | 含义 |
+| --- | --- |
+| `X-Preview-Rows` / `X-Preview-Columns` | 图像行/列数 |
+| `X-Preview-Bits-Allocated` / `X-Preview-Bits-Stored` | 源影像分配/有效位深（8/16） |
+| `X-Preview-Photometric-Interpretation` | `MONOCHROME1` / `MONOCHROME2` |
+| `X-Preview-Window` | `voi`（使用 WindowCenter/Width 首项）或 `minmax`（缺窗按像素极值拉伸） |
+| `X-Preview-Rescale-Slope` / `X-Preview-Rescale-Intercept` | 实际使用的 Modality 线性映射参数 |
+
+```bash
+# 6) 取某个成功输出文件的匿名 SOPInstanceUID，在浏览器或 curl 中查看 PNG
+SOP_UID=$(python3 -c "
+import json
+job=json.load(open('job.json'))
+print(next(f['sop_instance_uid'] for f in job['files'] if f['status']=='ok'))")
+
+curl -f "http://localhost:8000/jobs/$JOB_ID/instances/$SOP_UID/preview.png" -o preview.png
+xdg-open preview.png   # 或直接在浏览器访问该 URL
+
+# 或直接用输出文件名（去掉 .dcm 即匿名 SOP UID）
+curl -f "http://localhost:8000/jobs/$JOB_ID/instances/$SOP_UID/preview.png" \
+  -D - -o preview.png | grep -i '^x-preview-'
+# x-preview-rows: 4
+# x-preview-columns: 4
+# x-preview-bits-allocated: 16
+# x-preview-bits-stored: 16
+# x-preview-photometric-interpretation: MONOCHROME2
+# x-preview-window: minmax
+# x-preview-rescale-slope: 1.0
+# x-preview-rescale-intercept: 0.0
+```
+
+Python 示例（含 404/409/422 处理）：
+
+```python
+resp = requests.get(
+    f"http://localhost:8000/jobs/{job_id}/instances/{anon_sop_uid}/preview.png"
+)
+if resp.status_code == 404:
+    print("任务或匿名实例不存在：", resp.json()["detail"]["code"])
+elif resp.status_code == 409:
+    detail = resp.json()["detail"]
+    print("无法预览：", detail["code"])          # JOB_NOT_READY / AMBIGUOUS_INSTANCE_OUTPUT
+    print("冲突文件：", detail.get("output_files"))
+elif resp.status_code == 422:
+    detail = resp.json()["detail"]
+    print("影像无法解码或不受支持：", detail["code"], detail["reason"], detail["message"])
+    # reason: unreadable | unsupported_transfer_syntax | unsupported_samples_per_pixel |
+    #         unsupported_photometric_interpretation | multiframe | unsupported_bit_depth |
+    #         invalid_pixel_metadata | missing_pixel_data | pixel_decode_failed |
+    #         invalid_rescale | invalid_voi_window | sop_instance_uid_mismatch
+else:
+    resp.raise_for_status()
+    open("preview.png", "wb").write(resp.content)
+    print("窗模式：", resp.headers["X-Preview-Window"])
+```
+
+> 注意：预览只做线性 Modality LUT + 线性 VOI 窗，**不应用** Presentation LUT、
+> 不应用 LUTData、不做几何变换（不缩放、不旋转、不叠加任何标注），目的仅为快速
+> 人工核对影像内容；需要诊断级阅片请下载匿名 ZIP / DICOMDIR 包用专业阅片软件打开。
 
 ### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
 
@@ -809,8 +921,9 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、实例 PNG 预览、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
+│   ├── preview.py       # 按匿名 SOP UID 从成功输出渲染单帧 8 位灰度 PNG：Rescale→VOI 窗/极值拉伸→MONOCHROME1 反相
 │   ├── dicomdir.py      # 从匿名输出重建 DICOMDIR 四级层级、稳定短 File ID、引用校验与阅片 ZIP
 │   ├── study_subset.py  # 按匿名 StudyInstanceUID 的引用闭包解析与子集 ZIP（复用匿名输出）
 │   ├── merged_study.py  # 跨 2～5 个同密钥任务的检查合并：跨任务引用闭包、字节去重/冲突/缺失 409
@@ -819,9 +932,9 @@ else:
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR 下载错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR（144 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览（174 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

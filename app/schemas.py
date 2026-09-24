@@ -353,6 +353,42 @@ class StudySubsetErrorDetail(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# 实例影像 PNG 预览（GET /jobs/{id}/instances/{uid}/preview.png）
+# --------------------------------------------------------------------------- #
+class PreviewErrorDetail(BaseModel):
+    code: str = Field(
+        description="INSTANCE_NOT_FOUND（404，匿名 SOP UID 不在任务成功输出中） | "
+        "INSTANCE_OUTPUT_MISSING（404，任务记录有该输出但磁盘文件已不存在） | "
+        "JOB_NOT_READY（409，任务处理失败） | "
+        "AMBIGUOUS_INSTANCE_OUTPUT（409，同一匿名 SOP UID 对应多份输出） | "
+        "PREVIEW_UNSUPPORTED_IMAGE（422，无法解码或影像类型不支持）"
+    )
+    message: str
+    sop_instance_uid: Optional[str] = None
+    reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "PREVIEW_UNSUPPORTED_IMAGE 的机器可读细分原因："
+            "unreadable | unsupported_transfer_syntax | unsupported_samples_per_pixel | "
+            "unsupported_photometric_interpretation | multiframe | unsupported_bit_depth | "
+            "invalid_pixel_metadata | missing_pixel_data | pixel_decode_failed | "
+            "invalid_rescale | invalid_voi_window | sop_instance_uid_mismatch；"
+            "AMBIGUOUS_INSTANCE_OUTPUT 时为 ambiguous_output；"
+            "INSTANCE_OUTPUT_MISSING 时为 output_missing"
+        ),
+    )
+    output_file: Optional[str] = Field(
+        default=None, description="可定位时给出任务 output 目录内的扁平文件名"
+    )
+    output_files: list[str] = Field(
+        default=[], description="reason=ambiguous_output 时给出相互冲突的输出文件名"
+    )
+    transfer_syntax_uid: Optional[str] = Field(
+        default=None, description="reason=unsupported_transfer_syntax 时回传实际传输语法 UID"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # DICOMDIR 离线阅片包下载（GET /jobs/{id}/dicomdir/download）
 # --------------------------------------------------------------------------- #
 class DicomDirProblemItem(BaseModel):

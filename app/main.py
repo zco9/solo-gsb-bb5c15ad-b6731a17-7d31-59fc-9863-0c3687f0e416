@@ -9,10 +9,10 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from .anonymizer import JobResult
-from . import consistency, dicomdir, merged_study, pagination, study_subset
+from . import consistency, dicomdir, merged_study, pagination, preview, study_subset
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -27,6 +27,7 @@ from .schemas import (
     MergedStudyDownloadRequest,
     MergedStudyErrorDetail,
     PatientOut,
+    PreviewErrorDetail,
     SeriesOut,
     StudyOut,
     StudySubsetErrorDetail,
@@ -49,7 +50,8 @@ app = FastAPI(
         "Patient/Study/Series/SOP/FrameOfReference UID 与身份字段，"
         "递归更新序列内引用并保持检查关系。提供标签变更预览与匿名化 ZIP 下载，"
         "支持按匿名检查下载子集、跨多个同密钥任务合并下载同一检查、"
-        "生成带 DICOMDIR 的离线阅片 ZIP，"
+        "生成带 DICOMDIR 的离线阅片 ZIP、"
+        "按匿名 SOPInstanceUID 渲染单帧灰度 PNG 预览供人工核对，"
         "并支持对多个已完成任务做跨批次密钥指纹/伪名/UID 映射一致性核对。"
     ),
     lifespan=lifespan,
@@ -560,6 +562,72 @@ def _safe_unlink(path: str) -> None:
 
 
 @app.get(
+    "/jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
+    tags=["jobs"],
+    response_class=Response,
+    summary="按匿名 SOPInstanceUID 渲染单帧灰度 PNG 预览（人工核对影像内容）",
+    responses={
+        200: {"content": {"image/png": {"schema": {"type": "string",
+                                                   "format": "binary"}}},
+              "description": "8 位灰度 PNG（inline 显示）；X-Preview-* 头回传渲染参数"},
+        404: {"model": PreviewErrorDetail,
+              "description": "任务不存在/已过期，或该匿名 SOP UID 不在任务的成功输出中"},
+        409: {"model": PreviewErrorDetail,
+              "description": "任务未完成，或同一匿名 SOP UID 对应多份输出文件"},
+        422: {"model": PreviewErrorDetail,
+              "description": "匿名输出无法解码，或影像类型不支持（压缩/多帧/非 8/16 位 "
+                             "MONOCHROME1/2 等）"},
+    },
+)
+def download_instance_preview(job_id: str, sop_instance_uid: str) -> Response:
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "任务不存在或已过期",
+                "sop_instance_uid": sop_instance_uid,
+            },
+        )
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+                "sop_instance_uid": sop_instance_uid,
+            },
+        )
+
+    try:
+        rendered = preview.render_preview_png(job, sop_instance_uid)
+    except preview.PreviewError as exc:
+        raise HTTPException(
+            status_code=exc.http_status, detail=exc.detail
+        ) from exc
+
+    # Content-Disposition filename 只允许 token 字符；匿名 UID 为 2.25.<digits>，
+    # 点号安全，额外保留 UID 后 24 位避免过长；inline 便于浏览器直接显示供核对
+    safe_uid = "".join(
+        ch for ch in sop_instance_uid if ch.isalnum() or ch in ".-"
+    )
+    filename = f"preview-{safe_uid[-24:]}.png"
+    headers = {
+        "Content-Disposition": f'inline; filename="{filename}"',
+        "X-Preview-Rows": str(rendered.rows),
+        "X-Preview-Columns": str(rendered.columns),
+        "X-Preview-Bits-Allocated": str(rendered.bits_allocated),
+        "X-Preview-Bits-Stored": str(rendered.bits_stored),
+        "X-Preview-Photometric-Interpretation": rendered.photometric_interpretation,
+        "X-Preview-Window": rendered.window_source,
+        "X-Preview-Rescale-Slope": repr(rendered.rescale_slope),
+        "X-Preview-Rescale-Intercept": repr(rendered.rescale_intercept),
+    }
+    return Response(content=rendered.png, media_type="image/png", headers=headers)
+
+
+@app.get(
     "/jobs/{job_id}/dicomdir/download",
     tags=["jobs"],
     summary="下载带 DICOMDIR 的离线阅片 ZIP（按匿名伪名/UID 重建患者-检查-系列-实例层级）",
@@ -619,6 +687,7 @@ def root() -> dict:
             "GET /jobs/{job_id}/download",
             "GET /jobs/{job_id}/dicomdir/download",
             "GET /jobs/{job_id}/studies/{study_instance_uid}/download",
+            "GET /jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
             "GET /health",
         ],
     }
